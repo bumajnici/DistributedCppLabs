@@ -1,0 +1,12 @@
+.vs/
+**/.vs/
+Debug/
+Release/
+x64/
+x86/
+**/x64/
+**/Debug/
+**/Release/
+*.user
+*.suo
+*.aps
