@@ -21,6 +21,12 @@
 #define IDC_APPLY_THREADS 2002
 #define IDC_STATUS_TEXT 2003
 #define IDC_STOP_THREADS 2004
+#define IDC_EXPERIMENT 2005
+#define IDC_EXPERIMENT_COUNT 3001
+#define IDC_EXPERIMENT_START 3002
+#define IDC_EXPERIMENT_CANCEL 3003
+#define WM_EXPERIMENT_DONE (WM_APP + 2)
+#define EXPERIMENT_MAX_VALUES 10000000
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -29,6 +35,9 @@ WCHAR szWindowClass[MAX_LOADSTRING];
 ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK ExperimentSettingsProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK ExperimentResultsProc(HWND, UINT, WPARAM, LPARAM);
+void StopWorkers();
 INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
 struct SharedState
@@ -47,6 +56,28 @@ HANDLE stopEvent = nullptr;
 HANDLE dataEvent = nullptr;
 std::vector<HANDLE> workerHandles;
 SharedState sharedState;
+
+struct ExperimentResult
+{
+    int threadCount;
+    double elapsedMilliseconds;
+    double cpuLoadPercent;
+};
+
+struct ExperimentWorkerContext
+{
+    size_t first;
+    size_t last;
+};
+
+HANDLE experimentMutex = nullptr;
+HANDLE experimentController = nullptr;
+HWND experimentSettingsWindow = nullptr;
+HWND experimentResultsWindow = nullptr;
+std::vector<int> experimentValues;
+std::vector<ExperimentResult> experimentResults;
+long long experimentSum = 0;
+bool experimentRunning = false;
 
 void LogMessage(const char* message, DWORD threadId)
 {
@@ -108,6 +139,244 @@ DWORD WINAPI WorkerThreadProc(LPVOID parameter)
 
     LogMessage("Finished", threadId);
     ExitThread(0);
+}
+
+DWORD WINAPI ExperimentWorkerProc(LPVOID parameter)
+{
+    auto* context = static_cast<ExperimentWorkerContext*>(parameter);
+    long long localSum = 0;
+    for (size_t index = context->first; index < context->last; ++index)
+    {
+        localSum += experimentValues[index];
+    }
+
+    if (WaitForSingleObject(experimentMutex, INFINITE) == WAIT_OBJECT_0)
+    {
+        experimentSum += localSum;
+        ReleaseMutex(experimentMutex);
+    }
+
+    delete context;
+    ExitThread(0);
+}
+
+double FileTimeToMilliseconds(const FILETIME& time)
+{
+    ULARGE_INTEGER value{};
+    value.LowPart = time.dwLowDateTime;
+    value.HighPart = time.dwHighDateTime;
+    return static_cast<double>(value.QuadPart) / 10000.0;
+}
+
+ExperimentResult RunExperiment(int threadCount)
+{
+    LARGE_INTEGER frequency{}, startCounter{}, endCounter{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&startCounter);
+
+    FILETIME creation{}, exit{}, kernelStart{}, userStart{};
+    FILETIME kernelEnd{}, userEnd{};
+    GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernelStart, &userStart);
+
+    experimentSum = 0;
+    std::vector<HANDLE> handles;
+    const size_t valuesPerThread = experimentValues.size() / threadCount;
+    size_t first = 0;
+
+    for (int index = 0; index < threadCount; ++index)
+    {
+        const size_t last = index == threadCount - 1
+            ? experimentValues.size()
+            : first + valuesPerThread;
+        auto* context = new ExperimentWorkerContext{ first, last };
+        HANDLE worker = CreateThread(nullptr, 0, ExperimentWorkerProc, context, 0, nullptr);
+        if (worker == nullptr)
+        {
+            delete context;
+            continue;
+        }
+        handles.push_back(worker);
+        first = last;
+    }
+
+    if (!handles.empty())
+    {
+        WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), TRUE, INFINITE);
+    }
+    for (HANDLE handle : handles)
+    {
+        CloseHandle(handle);
+    }
+
+    GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernelEnd, &userEnd);
+    QueryPerformanceCounter(&endCounter);
+
+    const double elapsedMilliseconds = static_cast<double>(endCounter.QuadPart - startCounter.QuadPart)
+        * 1000.0 / static_cast<double>(frequency.QuadPart);
+    const double processMilliseconds =
+        FileTimeToMilliseconds(kernelEnd) + FileTimeToMilliseconds(userEnd)
+        - FileTimeToMilliseconds(kernelStart) - FileTimeToMilliseconds(userStart);
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const double cpuLoad = elapsedMilliseconds > 0.0
+        ? processMilliseconds / elapsedMilliseconds * 100.0 / systemInfo.dwNumberOfProcessors
+        : 0.0;
+
+    return { threadCount, elapsedMilliseconds, cpuLoad };
+}
+
+DWORD WINAPI ExperimentControllerProc(LPVOID parameter)
+{
+    const int valueCount = static_cast<int>(reinterpret_cast<INT_PTR>(parameter));
+    experimentValues.resize(valueCount);
+    std::mt19937 generator(123456789u);
+    std::uniform_int_distribution<int> distribution(1, 100);
+    for (int& value : experimentValues)
+    {
+        value = distribution(generator);
+    }
+
+    experimentResults.clear();
+    for (const int threadCount : { 2, 4, 8, 16 })
+    {
+        experimentResults.push_back(RunExperiment(threadCount));
+    }
+
+    PostMessage(mainWindow, WM_EXPERIMENT_DONE, 0, 0);
+    ExitThread(0);
+}
+
+void ShowExperimentResults()
+{
+    std::wstringstream table;
+    table << L"Threads\tExecution time (ms)\tAverage CPU load (%)\r\n";
+    table << L"------------------------------------------------------------\r\n";
+    for (const ExperimentResult& result : experimentResults)
+    {
+        table << result.threadCount << L"\t"
+              << std::fixed << std::setprecision(2) << result.elapsedMilliseconds << L"\t\t"
+              << result.cpuLoadPercent << L"\r\n";
+    }
+
+    experimentResultsWindow = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, L"Lab3ExperimentResults", L"Experiment Results",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 650, 260, mainWindow, nullptr, hInst, nullptr);
+    CreateWindowW(L"EDIT", table.str().c_str(),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY,
+        15, 15, 610, 180, experimentResultsWindow, nullptr, hInst, nullptr);
+}
+
+void ShowExperimentSettings()
+{
+    if (experimentSettingsWindow != nullptr)
+    {
+        SetForegroundWindow(experimentSettingsWindow);
+        return;
+    }
+
+    experimentSettingsWindow = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, L"Lab3ExperimentSettings", L"Experiment Settings",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, 360, 180, mainWindow, nullptr, hInst, nullptr);
+    CreateWindowW(L"STATIC", L"Number of values (1 - 1000000):",
+        WS_CHILD | WS_VISIBLE, 20, 20, 230, 24, experimentSettingsWindow,
+        nullptr, hInst, nullptr);
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"100000",
+        WS_CHILD | WS_VISIBLE | ES_NUMBER, 20, 48, 180, 26,
+        experimentSettingsWindow, reinterpret_cast<HMENU>(IDC_EXPERIMENT_COUNT), hInst, nullptr);
+    CreateWindowW(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        20, 95, 90, 28, experimentSettingsWindow,
+        reinterpret_cast<HMENU>(IDC_EXPERIMENT_START), hInst, nullptr);
+    CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        120, 95, 90, 28, experimentSettingsWindow,
+        reinterpret_cast<HMENU>(IDC_EXPERIMENT_CANCEL), hInst, nullptr);
+    ShowWindow(experimentSettingsWindow, SW_SHOW);
+}
+
+void RegisterExperimentWindowClasses()
+{
+    WNDCLASSW settingsClass{};
+    settingsClass.lpfnWndProc = ExperimentSettingsProc;
+    settingsClass.hInstance = hInst;
+    settingsClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    settingsClass.lpszClassName = L"Lab3ExperimentSettings";
+    RegisterClassW(&settingsClass);
+
+    WNDCLASSW resultsClass{};
+    resultsClass.lpfnWndProc = ExperimentResultsProc;
+    resultsClass.hInstance = hInst;
+    resultsClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    resultsClass.lpszClassName = L"Lab3ExperimentResults";
+    RegisterClassW(&resultsClass);
+}
+
+LRESULT CALLBACK ExperimentSettingsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    UNREFERENCED_PARAMETER(lParam);
+    switch (message)
+    {
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_EXPERIMENT_CANCEL)
+        {
+            DestroyWindow(hWnd);
+        }
+        else if (LOWORD(wParam) == IDC_EXPERIMENT_START)
+        {
+            wchar_t buffer[32]{};
+            HWND input = GetDlgItem(hWnd, IDC_EXPERIMENT_COUNT);
+            GetWindowTextW(input, buffer, _countof(buffer));
+            const int valueCount = _wtoi(buffer);
+            if (valueCount < 1 || valueCount > EXPERIMENT_MAX_VALUES)
+            {
+                MessageBoxW(hWnd, L"Enter a value from 1 to 1000000.",
+                    L"Invalid value", MB_OK | MB_ICONWARNING);
+                break;
+            }
+
+            if (!workerHandles.empty())
+            {
+                const int answer = MessageBoxW(hWnd,
+                    L"Active worker threads will be stopped before the experiment starts. Continue?",
+                    L"Confirm experiment", MB_YESNO | MB_ICONQUESTION);
+                if (answer != IDYES)
+                {
+                    break;
+                }
+                StopWorkers();
+            }
+
+            experimentRunning = true;
+            EnableWindow(GetDlgItem(hWnd, IDC_EXPERIMENT_START), FALSE);
+            DestroyWindow(hWnd);
+            experimentController = CreateThread(nullptr, 0, ExperimentControllerProc,
+                reinterpret_cast<LPVOID>(static_cast<INT_PTR>(valueCount)), 0, nullptr);
+            if (experimentController == nullptr)
+            {
+                experimentRunning = false;
+                MessageBoxW(mainWindow, L"Failed to start the experiment.",
+                    L"Experiment error", MB_OK | MB_ICONERROR);
+            }
+        }
+        break;
+    case WM_DESTROY:
+        experimentSettingsWindow = nullptr;
+        break;
+    default:
+        return DefWindowProcW(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+LRESULT CALLBACK ExperimentResultsProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    UNREFERENCED_PARAMETER(wParam);
+    UNREFERENCED_PARAMETER(lParam);
+    if (message == WM_DESTROY)
+    {
+        experimentResultsWindow = nullptr;
+    }
+    return DefWindowProcW(hWnd, message, wParam, lParam);
 }
 
 void StopWorkers()
@@ -214,12 +483,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         return FALSE;
     }
 
+    RegisterExperimentWindowClasses();
     resourceMutex = CreateMutexW(nullptr, FALSE, nullptr);
+    experimentMutex = CreateMutexW(nullptr, FALSE, nullptr);
     startEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
     stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     dataEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-    if (resourceMutex == nullptr || startEvent == nullptr ||
+    if (resourceMutex == nullptr || experimentMutex == nullptr || startEvent == nullptr ||
         stopEvent == nullptr || dataEvent == nullptr ||
         !StartWorkers(DEFAULT_WORKER_COUNT))
     {
@@ -274,6 +545,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         295, 18, 80, 26, hWnd, reinterpret_cast<HMENU>(IDC_STOP_THREADS),
         hInstance, nullptr);
+    CreateWindowW(L"BUTTON", L"Experiment", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        385, 18, 100, 26, hWnd, reinterpret_cast<HMENU>(IDC_EXPERIMENT),
+        hInstance, nullptr);
     statusText = CreateWindowW(L"STATIC", L"Starting workers...",
         WS_CHILD | WS_VISIBLE, 20, 80, 560, 100, hWnd, nullptr, hInstance, nullptr);
 
@@ -312,6 +586,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             StopWorkers();
         }
+        else if (LOWORD(wParam) == IDC_EXPERIMENT)
+        {
+            if (experimentRunning)
+            {
+                MessageBoxW(hWnd, L"An experiment is already running.",
+                    L"Experiment", MB_OK | MB_ICONINFORMATION);
+            }
+            else
+            {
+                ShowExperimentSettings();
+            }
+        }
         else if (LOWORD(wParam) == IDM_ABOUT)
         {
             DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
@@ -343,12 +629,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_DESTROY:
         KillTimer(hWnd, TIMER_ID);
         StopWorkers();
+        if (experimentController != nullptr)
+        {
+            WaitForSingleObject(experimentController, INFINITE);
+            CloseHandle(experimentController);
+            experimentController = nullptr;
+        }
         if (resourceMutex != nullptr) CloseHandle(resourceMutex);
         if (startEvent != nullptr) CloseHandle(startEvent);
         if (stopEvent != nullptr) CloseHandle(stopEvent);
         if (dataEvent != nullptr) CloseHandle(dataEvent);
+        if (experimentMutex != nullptr) CloseHandle(experimentMutex);
         PostQuitMessage(0);
         FreeConsole();
+        break;
+    case WM_EXPERIMENT_DONE:
+        if (experimentController != nullptr)
+        {
+            WaitForSingleObject(experimentController, INFINITE);
+            CloseHandle(experimentController);
+            experimentController = nullptr;
+        }
+        experimentRunning = false;
+        ShowExperimentResults();
         break;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
