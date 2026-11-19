@@ -25,9 +25,11 @@
 #define IDC_EXPERIMENT_COUNT 3001
 #define IDC_EXPERIMENT_START 3002
 #define IDC_EXPERIMENT_CANCEL 3003
+#define IDC_EXPERIMENT_ITERATIONS 3004
 #define WM_EXPERIMENT_DONE (WM_APP + 2)
 #define EXPERIMENT_MAX_VALUES 1000000000
-#define EXPERIMENT_REPETITIONS 10
+#define EXPERIMENT_DEFAULT_REPETITIONS 10
+#define EXPERIMENT_MAX_REPETITIONS 1000
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -79,6 +81,7 @@ std::vector<int> experimentValues;
 std::vector<ExperimentResult> experimentResults;
 long long experimentSum = 0;
 bool experimentRunning = false;
+int experimentRepetitions = EXPERIMENT_DEFAULT_REPETITIONS;
 
 void LogMessage(const char* message, DWORD threadId)
 {
@@ -146,7 +149,7 @@ DWORD WINAPI ExperimentWorkerProc(LPVOID parameter)
 {
     auto* context = static_cast<ExperimentWorkerContext*>(parameter);
     long long localSum = 0;
-    for (int repetition = 0; repetition < EXPERIMENT_REPETITIONS; ++repetition)
+    for (int repetition = 0; repetition < experimentRepetitions; ++repetition)
     {
         for (size_t index = context->first; index < context->last; ++index)
         {
@@ -225,7 +228,7 @@ ExperimentResult RunExperiment(int threadCount)
     const double cpuLoad = totalElapsedMilliseconds > 0.0
         ? processMilliseconds / totalElapsedMilliseconds * 100.0 / systemInfo.dwNumberOfProcessors
         : 0.0;
-    const double elapsedMilliseconds = totalElapsedMilliseconds / EXPERIMENT_REPETITIONS;
+    const double elapsedMilliseconds = totalElapsedMilliseconds / experimentRepetitions;
 
     return { threadCount, elapsedMilliseconds, cpuLoad };
 }
@@ -288,18 +291,24 @@ void ShowExperimentSettings()
     experimentSettingsWindow = CreateWindowExW(
         WS_EX_DLGMODALFRAME, L"Lab3ExperimentSettings", L"Experiment Settings",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 360, 180, mainWindow, nullptr, hInst, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 440, 240, mainWindow, nullptr, hInst, nullptr);
     CreateWindowW(L"STATIC", L"Number of values (1 - 1000000000):",
         WS_CHILD | WS_VISIBLE, 20, 20, 230, 24, experimentSettingsWindow,
         nullptr, hInst, nullptr);
     CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10000000",
         WS_CHILD | WS_VISIBLE | ES_NUMBER, 20, 48, 180, 26,
         experimentSettingsWindow, reinterpret_cast<HMENU>(IDC_EXPERIMENT_COUNT), hInst, nullptr);
+    CreateWindowW(L"STATIC", L"Iterations (1 - 1000):",
+        WS_CHILD | WS_VISIBLE, 20, 82, 230, 24, experimentSettingsWindow,
+        nullptr, hInst, nullptr);
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10",
+        WS_CHILD | WS_VISIBLE | ES_NUMBER, 20, 110, 180, 26,
+        experimentSettingsWindow, reinterpret_cast<HMENU>(IDC_EXPERIMENT_ITERATIONS), hInst, nullptr);
     CreateWindowW(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        20, 95, 90, 28, experimentSettingsWindow,
+        20, 155, 90, 28, experimentSettingsWindow,
         reinterpret_cast<HMENU>(IDC_EXPERIMENT_START), hInst, nullptr);
     CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        120, 95, 90, 28, experimentSettingsWindow,
+        120, 155, 90, 28, experimentSettingsWindow,
         reinterpret_cast<HMENU>(IDC_EXPERIMENT_CANCEL), hInst, nullptr);
     ShowWindow(experimentSettingsWindow, SW_SHOW);
 }
@@ -344,6 +353,17 @@ LRESULT CALLBACK ExperimentSettingsProc(HWND hWnd, UINT message, WPARAM wParam, 
                 break;
             }
 
+            wchar_t iterationBuffer[16]{};
+            HWND iterationInput = GetDlgItem(hWnd, IDC_EXPERIMENT_ITERATIONS);
+            GetWindowTextW(iterationInput, iterationBuffer, _countof(iterationBuffer));
+            const int repetitions = _wtoi(iterationBuffer);
+            if (repetitions < 1 || repetitions > EXPERIMENT_MAX_REPETITIONS)
+            {
+                MessageBoxW(hWnd, L"Enter the number of iterations from 1 to 1000.",
+                    L"Invalid value", MB_OK | MB_ICONWARNING);
+                break;
+            }
+
             if (!workerHandles.empty())
             {
                 const int answer = MessageBoxW(hWnd,
@@ -356,6 +376,7 @@ LRESULT CALLBACK ExperimentSettingsProc(HWND hWnd, UINT message, WPARAM wParam, 
                 StopWorkers();
             }
 
+            experimentRepetitions = repetitions;
             experimentRunning = true;
             EnableWindow(GetDlgItem(hWnd, IDC_EXPERIMENT_START), FALSE);
             DestroyWindow(hWnd);
