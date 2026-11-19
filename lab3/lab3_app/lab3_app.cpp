@@ -26,7 +26,8 @@
 #define IDC_EXPERIMENT_START 3002
 #define IDC_EXPERIMENT_CANCEL 3003
 #define WM_EXPERIMENT_DONE (WM_APP + 2)
-#define EXPERIMENT_MAX_VALUES 10000000
+#define EXPERIMENT_MAX_VALUES 1000000000
+#define EXPERIMENT_REPETITIONS 10
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -145,9 +146,12 @@ DWORD WINAPI ExperimentWorkerProc(LPVOID parameter)
 {
     auto* context = static_cast<ExperimentWorkerContext*>(parameter);
     long long localSum = 0;
-    for (size_t index = context->first; index < context->last; ++index)
+    for (int repetition = 0; repetition < EXPERIMENT_REPETITIONS; ++repetition)
     {
-        localSum += experimentValues[index];
+        for (size_t index = context->first; index < context->last; ++index)
+        {
+            localSum += experimentValues[index];
+        }
     }
 
     if (WaitForSingleObject(experimentMutex, INFINITE) == WAIT_OBJECT_0)
@@ -211,16 +215,17 @@ ExperimentResult RunExperiment(int threadCount)
     GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernelEnd, &userEnd);
     QueryPerformanceCounter(&endCounter);
 
-    const double elapsedMilliseconds = static_cast<double>(endCounter.QuadPart - startCounter.QuadPart)
+    const double totalElapsedMilliseconds = static_cast<double>(endCounter.QuadPart - startCounter.QuadPart)
         * 1000.0 / static_cast<double>(frequency.QuadPart);
     const double processMilliseconds =
         FileTimeToMilliseconds(kernelEnd) + FileTimeToMilliseconds(userEnd)
         - FileTimeToMilliseconds(kernelStart) - FileTimeToMilliseconds(userStart);
     SYSTEM_INFO systemInfo{};
     GetSystemInfo(&systemInfo);
-    const double cpuLoad = elapsedMilliseconds > 0.0
-        ? processMilliseconds / elapsedMilliseconds * 100.0 / systemInfo.dwNumberOfProcessors
+    const double cpuLoad = totalElapsedMilliseconds > 0.0
+        ? processMilliseconds / totalElapsedMilliseconds * 100.0 / systemInfo.dwNumberOfProcessors
         : 0.0;
+    const double elapsedMilliseconds = totalElapsedMilliseconds / EXPERIMENT_REPETITIONS;
 
     return { threadCount, elapsedMilliseconds, cpuLoad };
 }
@@ -249,22 +254,27 @@ DWORD WINAPI ExperimentControllerProc(LPVOID parameter)
 void ShowExperimentResults()
 {
     std::wstringstream table;
-    table << L"Threads\tExecution time (ms)\tAverage CPU load (%)\r\n";
-    table << L"------------------------------------------------------------\r\n";
+    table << std::left << std::setw(12) << L"Threads"
+          << std::setw(26) << L"Execution time (ms)"
+          << L"Average CPU load (%)\r\n";
+    table << L"--------------------------------------------------------------------------\r\n";
     for (const ExperimentResult& result : experimentResults)
     {
-        table << result.threadCount << L"\t"
-              << std::fixed << std::setprecision(2) << result.elapsedMilliseconds << L"\t\t"
-              << result.cpuLoadPercent << L"\r\n";
+        table << std::left << std::setw(12) << result.threadCount
+              << std::setw(26) << std::fixed << std::setprecision(2)
+              << result.elapsedMilliseconds
+              << std::fixed << std::setprecision(6) << result.cpuLoadPercent << L"\r\n";
     }
 
     experimentResultsWindow = CreateWindowExW(
         WS_EX_DLGMODALFRAME, L"Lab3ExperimentResults", L"Experiment Results",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 650, 260, mainWindow, nullptr, hInst, nullptr);
-    CreateWindowW(L"EDIT", table.str().c_str(),
+        CW_USEDEFAULT, CW_USEDEFAULT, 780, 260, mainWindow, nullptr, hInst, nullptr);
+    HWND tableControl = CreateWindowW(L"EDIT", table.str().c_str(),
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY,
-        15, 15, 610, 180, experimentResultsWindow, nullptr, hInst, nullptr);
+        15, 15, 740, 180, experimentResultsWindow, nullptr, hInst, nullptr);
+    SendMessage(tableControl, WM_SETFONT,
+        reinterpret_cast<WPARAM>(GetStockObject(SYSTEM_FIXED_FONT)), TRUE);
 }
 
 void ShowExperimentSettings()
@@ -279,10 +289,10 @@ void ShowExperimentSettings()
         WS_EX_DLGMODALFRAME, L"Lab3ExperimentSettings", L"Experiment Settings",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT, 360, 180, mainWindow, nullptr, hInst, nullptr);
-    CreateWindowW(L"STATIC", L"Number of values (1 - 1000000):",
+    CreateWindowW(L"STATIC", L"Number of values (1 - 1000000000):",
         WS_CHILD | WS_VISIBLE, 20, 20, 230, 24, experimentSettingsWindow,
         nullptr, hInst, nullptr);
-    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"100000",
+    CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10000000",
         WS_CHILD | WS_VISIBLE | ES_NUMBER, 20, 48, 180, 26,
         experimentSettingsWindow, reinterpret_cast<HMENU>(IDC_EXPERIMENT_COUNT), hInst, nullptr);
     CreateWindowW(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -329,7 +339,7 @@ LRESULT CALLBACK ExperimentSettingsProc(HWND hWnd, UINT message, WPARAM wParam, 
             const int valueCount = _wtoi(buffer);
             if (valueCount < 1 || valueCount > EXPERIMENT_MAX_VALUES)
             {
-                MessageBoxW(hWnd, L"Enter a value from 1 to 1000000.",
+                MessageBoxW(hWnd, L"Enter a value from 1 to 1000000000.",
                     L"Invalid value", MB_OK | MB_ICONWARNING);
                 break;
             }
