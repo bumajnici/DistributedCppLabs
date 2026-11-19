@@ -4,213 +4,344 @@
 #include "framework.h"
 #include "lab3_app.h"
 
-#include <condition_variable>
-#include <chrono>
+#include <cstdio>
 #include <deque>
 #include <iomanip>
-#include <mutex>
 #include <random>
 #include <sstream>
-#include <thread>
+#include <vector>
 
 #define MAX_LOADSTRING 100
 #define BUFFER_SIZE 10
-#define WM_UPDATE_VALUES (WM_APP + 1)
+#define TIMER_ID 1
+#define TIMER_INTERVAL 100
+#define DEFAULT_WORKER_COUNT 3
+#define MAX_WORKER_COUNT 64
+#define IDC_THREAD_COUNT_INPUT 2001
+#define IDC_APPLY_THREADS 2002
+#define IDC_STATUS_TEXT 2003
 
-// Global Variables:
-HINSTANCE hInst;                                // current instance
-WCHAR szTitle[MAX_LOADSTRING];                  // The title bar text
-WCHAR szWindowClass[MAX_LOADSTRING];            // the main window class name
+HINSTANCE hInst;
+WCHAR szTitle[MAX_LOADSTRING];
+WCHAR szWindowClass[MAX_LOADSTRING];
 
-// Forward declarations of functions included in this code module:
-ATOM                MyRegisterClass(HINSTANCE hInstance);
-BOOL                InitInstance(HINSTANCE, int);
-LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
+ATOM MyRegisterClass(HINSTANCE hInstance);
+BOOL InitInstance(HINSTANCE, int);
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
-struct DisplayValues
+struct SharedState
 {
-    int current;
-    double average;
+    std::deque<int> numbers;
+    int currentNumber = 0;
+    double average = 0.0;
 };
 
-std::mutex dataMutex;
-std::condition_variable dataAvailable;
-std::condition_variable resultAvailable;
-std::deque<int> numberBuffer;
-int currentNumber = 0;
-double currentAverage = 0.0;
-unsigned long long producedVersion = 0;
-unsigned long long calculatedVersion = 0;
-unsigned long long displayedVersion = 0;
-bool stopThreads = false;
 HWND mainWindow = nullptr;
-std::thread generatorThread;
-std::thread calculatorThread;
-std::thread displayThread;
+HWND threadCountInput = nullptr;
+HWND statusText = nullptr;
+HANDLE resourceMutex = nullptr;
+HANDLE startEvent = nullptr;
+HANDLE stopEvent = nullptr;
+HANDLE dataEvent = nullptr;
+std::vector<HANDLE> workerHandles;
+SharedState sharedState;
 
-void GenerateNumbers();
-void CalculateAverage();
-void DisplayValuesThread();
-void StopThreads();
+void LogMessage(const char* message, DWORD threadId)
+{
+    std::printf("[Thread %lu] %s\n", static_cast<unsigned long>(threadId), message);
+    std::fflush(stdout);
+}
+
+void LogResourceAccess(DWORD threadId, int number)
+{
+    std::printf("[Thread %lu] Accessing shared resource, generated %d\n",
+        static_cast<unsigned long>(threadId), number);
+    std::fflush(stdout);
+}
+
+DWORD WINAPI WorkerThreadProc(LPVOID parameter)
+{
+    UNREFERENCED_PARAMETER(parameter);
+    const DWORD threadId = GetCurrentThreadId();
+    LogMessage("Started", threadId);
+
+    if (WaitForSingleObject(startEvent, INFINITE) != WAIT_OBJECT_0)
+    {
+        LogMessage("Failed to receive start event", threadId);
+        ExitThread(1);
+    }
+
+    std::mt19937 generator(static_cast<unsigned int>(GetTickCount64() ^ threadId));
+    std::uniform_int_distribution<int> distribution(1, 100);
+
+    while (WaitForSingleObject(stopEvent, 100) == WAIT_TIMEOUT)
+    {
+        const int number = distribution(generator);
+
+        if (WaitForSingleObject(resourceMutex, INFINITE) != WAIT_OBJECT_0)
+        {
+            LogMessage("Failed to acquire mutex", threadId);
+            ExitThread(2);
+        }
+
+        sharedState.currentNumber = number;
+        sharedState.numbers.push_back(number);
+        if (sharedState.numbers.size() > BUFFER_SIZE)
+        {
+            sharedState.numbers.pop_front();
+        }
+
+        double sum = 0.0;
+        for (const int value : sharedState.numbers)
+        {
+            sum += value;
+        }
+        sharedState.average = sum / sharedState.numbers.size();
+        LogResourceAccess(threadId, number);
+
+        ReleaseMutex(resourceMutex);
+        SetEvent(dataEvent);
+        Sleep(100);
+    }
+
+    LogMessage("Finished", threadId);
+    ExitThread(0);
+}
+
+void StopWorkers()
+{
+    if (workerHandles.empty())
+    {
+        return;
+    }
+
+    SetEvent(stopEvent);
+    WaitForMultipleObjects(static_cast<DWORD>(workerHandles.size()),
+        workerHandles.data(), TRUE, INFINITE);
+
+    for (HANDLE worker : workerHandles)
+    {
+        CloseHandle(worker);
+    }
+    workerHandles.clear();
+    ResetEvent(stopEvent);
+    ResetEvent(dataEvent);
+}
+
+bool StartWorkers(int count)
+{
+    StopWorkers();
+    ResetEvent(stopEvent);
+    SetEvent(startEvent);
+
+    for (int index = 0; index < count; ++index)
+    {
+        HANDLE worker = CreateThread(nullptr, 0, WorkerThreadProc, nullptr, 0, nullptr);
+        if (worker == nullptr)
+        {
+            StopWorkers();
+            return false;
+        }
+        workerHandles.push_back(worker);
+    }
+
+    return true;
+}
+
+void UpdateDisplayedValues(HWND hWnd)
+{
+    if (WaitForSingleObject(dataEvent, 0) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(resourceMutex, INFINITE) != WAIT_OBJECT_0)
+    {
+        return;
+    }
+
+    std::wstringstream text;
+    text << L"Current number: " << sharedState.currentNumber << L"\n"
+         << L"Average of the last " << BUFFER_SIZE << L" numbers: "
+         << std::fixed << std::setprecision(2) << sharedState.average;
+    SetWindowTextW(statusText, text.str().c_str());
+
+    ReleaseMutex(resourceMutex);
+    ResetEvent(dataEvent);
+}
+
+void MonitorWorkers()
+{
+    if (workerHandles.empty() || WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0)
+    {
+        return;
+    }
+
+    const DWORD result = WaitForMultipleObjects(
+        static_cast<DWORD>(workerHandles.size()), workerHandles.data(), FALSE, 0);
+    if (result >= WAIT_OBJECT_0 &&
+        result < WAIT_OBJECT_0 + workerHandles.size())
+    {
+        SetWindowTextW(statusText, L"A worker terminated unexpectedly. Restarting...");
+        StartWorkers(static_cast<int>(workerHandles.size()));
+    }
+}
+
+int ReadWorkerCount()
+{
+    wchar_t buffer[16]{};
+    GetWindowTextW(threadCountInput, buffer, _countof(buffer));
+    const int count = _wtoi(buffer);
+    return count;
+}
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-                     _In_opt_ HINSTANCE hPrevInstance,
-                     _In_ LPWSTR    lpCmdLine,
-                     _In_ int       nCmdShow)
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPWSTR lpCmdLine,
+    _In_ int nCmdShow)
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // Initialize global strings
+    AllocConsole();
+    FILE* output = nullptr;
+    freopen_s(&output, "CONOUT$", "w", stdout);
+
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_LAB3APP, szWindowClass, MAX_LOADSTRING);
     MyRegisterClass(hInstance);
 
-    // Perform application initialization:
-    if (!InitInstance (hInstance, nCmdShow))
+    if (!InitInstance(hInstance, nCmdShow))
+    {
+        FreeConsole();
+        return FALSE;
+    }
+
+    resourceMutex = CreateMutexW(nullptr, FALSE, nullptr);
+    startEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+    stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    dataEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    if (resourceMutex == nullptr || startEvent == nullptr ||
+        stopEvent == nullptr || dataEvent == nullptr ||
+        !StartWorkers(DEFAULT_WORKER_COUNT))
+    {
+        DestroyWindow(mainWindow);
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return static_cast<int>(msg.wParam);
+}
+
+ATOM MyRegisterClass(HINSTANCE hInstance)
+{
+    WNDCLASSEXW wcex{};
+    wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = WndProc;
+    wcex.hInstance = hInstance;
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_LAB3APP));
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wcex.lpszMenuName = MAKEINTRESOURCEW(IDC_LAB3APP);
+    wcex.lpszClassName = szWindowClass;
+    wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
+    return RegisterClassExW(&wcex);
+}
+
+BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
+{
+    hInst = hInstance;
+    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, 620, 360, nullptr, nullptr, hInstance, nullptr);
+    if (!hWnd)
     {
         return FALSE;
     }
 
-    generatorThread = std::thread(GenerateNumbers);
-    calculatorThread = std::thread(CalculateAverage);
-    displayThread = std::thread(DisplayValuesThread);
+    mainWindow = hWnd;
+    CreateWindowW(L"STATIC", L"Worker threads:", WS_CHILD | WS_VISIBLE,
+        20, 20, 110, 24, hWnd, nullptr, hInstance, nullptr);
+    threadCountInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"3",
+        WS_CHILD | WS_VISIBLE | ES_NUMBER, 135, 18, 60, 26, hWnd,
+        reinterpret_cast<HMENU>(IDC_THREAD_COUNT_INPUT), hInstance, nullptr);
+    CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        205, 18, 80, 26, hWnd, reinterpret_cast<HMENU>(IDC_APPLY_THREADS),
+        hInstance, nullptr);
+    statusText = CreateWindowW(L"STATIC", L"Starting workers...",
+        WS_CHILD | WS_VISIBLE, 20, 80, 560, 100, hWnd, nullptr, hInstance, nullptr);
 
-    HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_LAB3APP));
-
-    MSG msg;
-
-    // Main message loop:
-    while (GetMessage(&msg, nullptr, 0, 0))
-    {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
-        {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-    }
-
-    return (int) msg.wParam;
+    SetTimer(hWnd, TIMER_ID, TIMER_INTERVAL, nullptr);
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+    return TRUE;
 }
 
-
-
-//
-//  FUNCTION: MyRegisterClass()
-//
-//  PURPOSE: Registers the window class.
-//
-ATOM MyRegisterClass(HINSTANCE hInstance)
-{
-    WNDCLASSEXW wcex;
-
-    wcex.cbSize = sizeof(WNDCLASSEX);
-
-    wcex.style          = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc    = WndProc;
-    wcex.cbClsExtra     = 0;
-    wcex.cbWndExtra     = 0;
-    wcex.hInstance      = hInstance;
-    wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_LAB3APP));
-    wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
-    wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_LAB3APP);
-    wcex.lpszClassName  = szWindowClass;
-    wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
-
-    return RegisterClassExW(&wcex);
-}
-
-//
-//   FUNCTION: InitInstance(HINSTANCE, int)
-//
-//   PURPOSE: Saves instance handle and creates main window
-//
-//   COMMENTS:
-//
-//        In this function, we save the instance handle in a global variable and
-//        create and display the main program window.
-//
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
-{
-   hInst = hInstance; // Store instance handle in our global variable
-
-   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
-
-   if (!hWnd)
-   {
-      return FALSE;
-   }
-
-   mainWindow = hWnd;
-
-   ShowWindow(hWnd, nCmdShow);
-   UpdateWindow(hWnd);
-
-   return TRUE;
-}
-
-//
-//  FUNCTION: WndProc(HWND, UINT, WPARAM, LPARAM)
-//
-//  PURPOSE: Processes messages for the main window.
-//
-//  WM_COMMAND  - process the application menu
-//  WM_PAINT    - Paint the main window
-//  WM_DESTROY  - post a quit message and return
-//
-//
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_APPLY_THREADS)
         {
-            int wmId = LOWORD(wParam);
-            // Parse the menu selections:
-            switch (wmId)
+            const int count = ReadWorkerCount();
+            if (count < 1 || count > MAX_WORKER_COUNT)
             {
-            case IDM_ABOUT:
-                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+                SetWindowTextW(statusText, L"Enter a value from 1 to 64.");
                 break;
-            case IDM_EXIT:
-                DestroyWindow(hWnd);
-                break;
-            default:
-                return DefWindowProc(hWnd, message, wParam, lParam);
+            }
+
+            if (StartWorkers(count))
+            {
+                std::wstringstream status;
+                status << L"Running " << count << L" worker threads.";
+                SetWindowTextW(statusText, status.str().c_str());
+            }
+            else
+            {
+                SetWindowTextW(statusText, L"Failed to create worker threads.");
             }
         }
+        else if (LOWORD(wParam) == IDM_ABOUT)
+        {
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+        }
+        else if (LOWORD(wParam) == IDM_EXIT)
+        {
+            DestroyWindow(hWnd);
+        }
+        else
+        {
+            return DefWindowProc(hWnd, message, wParam, lParam);
+        }
+        break;
+    case WM_TIMER:
+        UpdateDisplayedValues(hWnd);
+        MonitorWorkers();
         break;
     case WM_PAINT:
         {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hWnd, &ps);
-            std::wstringstream text;
-            text << L"Current number: " << currentNumber << L"\n"
-                 << L"Average of the last " << BUFFER_SIZE << L" numbers: "
-                 << std::fixed << std::setprecision(2) << currentAverage;
-
             RECT clientRect;
             GetClientRect(hWnd, &clientRect);
-            DrawTextW(hdc, text.str().c_str(), -1, &clientRect,
-                DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+            DrawTextW(hdc, L"Use Apply to change the number of running worker threads.",
+                -1, &clientRect, DT_CENTER | DT_BOTTOM | DT_SINGLELINE);
             EndPaint(hWnd, &ps);
         }
         break;
-    case WM_UPDATE_VALUES:
-        {
-            DisplayValues* values = reinterpret_cast<DisplayValues*>(lParam);
-            currentNumber = values->current;
-            currentAverage = values->average;
-            delete values;
-            InvalidateRect(hWnd, nullptr, TRUE);
-        }
-        break;
     case WM_DESTROY:
-        StopThreads();
+        KillTimer(hWnd, TIMER_ID);
+        StopWorkers();
+        if (resourceMutex != nullptr) CloseHandle(resourceMutex);
+        if (startEvent != nullptr) CloseHandle(startEvent);
+        if (stopEvent != nullptr) CloseHandle(stopEvent);
+        if (dataEvent != nullptr) CloseHandle(dataEvent);
         PostQuitMessage(0);
+        FreeConsole();
         break;
     default:
         return DefWindowProc(hWnd, message, wParam, lParam);
@@ -218,121 +349,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-void GenerateNumbers()
-{
-    std::mt19937 generator(std::random_device{}());
-    std::uniform_int_distribution<int> distribution(1, 100);
-
-    while (true)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-        std::lock_guard<std::mutex> lock(dataMutex);
-        if (stopThreads)
-        {
-            return;
-        }
-
-        currentNumber = distribution(generator);
-        numberBuffer.push_back(currentNumber);
-        if (numberBuffer.size() > BUFFER_SIZE)
-        {
-            numberBuffer.pop_front();
-        }
-        ++producedVersion;
-        dataAvailable.notify_one();
-    }
-}
-
-void CalculateAverage()
-{
-    while (true)
-    {
-        std::unique_lock<std::mutex> lock(dataMutex);
-        dataAvailable.wait(lock, []
-        {
-            return stopThreads || producedVersion != calculatedVersion;
-        });
-
-        if (stopThreads)
-        {
-            return;
-        }
-
-        double sum = 0.0;
-        for (int number : numberBuffer)
-        {
-            sum += number;
-        }
-        currentAverage = sum / numberBuffer.size();
-        calculatedVersion = producedVersion;
-        resultAvailable.notify_one();
-    }
-}
-
-void DisplayValuesThread()
-{
-    while (true)
-    {
-        std::unique_lock<std::mutex> lock(dataMutex);
-        resultAvailable.wait(lock, []
-        {
-            return stopThreads || calculatedVersion != displayedVersion;
-        });
-
-        if (stopThreads)
-        {
-            return;
-        }
-
-        displayedVersion = calculatedVersion;
-        DisplayValues* values = new DisplayValues{ currentNumber, currentAverage };
-        lock.unlock();
-        PostMessage(mainWindow, WM_UPDATE_VALUES, 0,
-            reinterpret_cast<LPARAM>(values));
-    }
-}
-
-void StopThreads()
-{
-    {
-        std::lock_guard<std::mutex> lock(dataMutex);
-        stopThreads = true;
-    }
-
-    dataAvailable.notify_all();
-    resultAvailable.notify_all();
-
-    if (generatorThread.joinable())
-    {
-        generatorThread.join();
-    }
-    if (calculatorThread.joinable())
-    {
-        calculatorThread.join();
-    }
-    if (displayThread.joinable())
-    {
-        displayThread.join();
-    }
-}
-
-// Message handler for about box.
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     UNREFERENCED_PARAMETER(lParam);
     switch (message)
     {
     case WM_INITDIALOG:
-        return (INT_PTR)TRUE;
-
+        return static_cast<INT_PTR>(TRUE);
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             EndDialog(hDlg, LOWORD(wParam));
-            return (INT_PTR)TRUE;
+            return static_cast<INT_PTR>(TRUE);
         }
         break;
     }
-    return (INT_PTR)FALSE;
+    return static_cast<INT_PTR>(FALSE);
 }
