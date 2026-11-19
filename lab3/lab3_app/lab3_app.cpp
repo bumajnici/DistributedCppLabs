@@ -20,6 +20,7 @@
 #define IDC_THREAD_COUNT_INPUT 2001
 #define IDC_APPLY_THREADS 2002
 #define IDC_STATUS_TEXT 2003
+#define IDC_STOP_THREADS 2004
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -125,7 +126,6 @@ void StopWorkers()
         CloseHandle(worker);
     }
     workerHandles.clear();
-    ResetEvent(stopEvent);
     ResetEvent(dataEvent);
 }
 
@@ -271,6 +271,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     CreateWindowW(L"BUTTON", L"Apply", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         205, 18, 80, 26, hWnd, reinterpret_cast<HMENU>(IDC_APPLY_THREADS),
         hInstance, nullptr);
+    CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        295, 18, 80, 26, hWnd, reinterpret_cast<HMENU>(IDC_STOP_THREADS),
+        hInstance, nullptr);
     statusText = CreateWindowW(L"STATIC", L"Starting workers...",
         WS_CHILD | WS_VISIBLE, 20, 80, 560, 100, hWnd, nullptr, hInstance, nullptr);
 
@@ -304,6 +307,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             {
                 SetWindowTextW(statusText, L"Failed to create worker threads.");
             }
+        }
+        else if (LOWORD(wParam) == IDC_STOP_THREADS)
+        {
+            StopWorkers();
         }
         else if (LOWORD(wParam) == IDM_ABOUT)
         {
